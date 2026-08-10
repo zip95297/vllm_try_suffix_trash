@@ -205,6 +205,7 @@ from vllm.v1.spec_decode.ngram_proposer_gpu import (
     update_ngram_gpu_tensors_incremental,
     update_scheduler_for_invalid_drafts,
 )
+from vllm.v1.spec_decode.suffix_proposer_gpu import SuffixProposerGPU
 from vllm.v1.spec_decode.step3p5 import Step3p5MTPProposer
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.spec_decode.utils import update_num_computed_tokens_for_batch_change
@@ -584,6 +585,7 @@ class GPUModelRunner(
             self.drafter: (
                 NgramProposer  # noqa: F823
                 | NgramProposerGPU
+                | SuffixProposerGPU
                 | SuffixDecodingProposer
                 | EagleProposer
                 | DFlashProposer
@@ -607,8 +609,15 @@ class GPUModelRunner(
                     device=self.device,
                     runner=self,
                 )
-            elif self.speculative_config.use_ngram_gpu():
-                self.drafter = NgramProposerGPU(self.vllm_config, self.device, self)
+            elif self.speculative_config.use_gpu_state_drafter():
+                if self.speculative_config.use_ngram_gpu():
+                    self.drafter = NgramProposerGPU(
+                        self.vllm_config, self.device, self
+                    )
+                else:
+                    self.drafter = SuffixProposerGPU(
+                        self.vllm_config, self.device, self
+                    )
                 self.num_tokens_no_spec_gpu = torch.zeros(
                     self.max_num_reqs, dtype=torch.int32, device=device
                 )
@@ -886,7 +895,7 @@ class GPUModelRunner(
         self._num_valid_draft_tokens_copy_stream: torch.cuda.Stream | None = None
         if (
             self.speculative_config is not None
-            and self.speculative_config.use_ngram_gpu()
+            and self.speculative_config.use_gpu_state_drafter()
         ):
             self._num_valid_draft_tokens_cpu = torch.empty(
                 self.max_num_reqs, dtype=torch.int32, pin_memory=PIN_MEMORY
@@ -1200,6 +1209,20 @@ class GPUModelRunner(
         self.late_interaction_runner.on_requests_finished(
             scheduler_output.finished_req_ids
         )
+        # Suffix GPU: flush finished responses into the global suffix
+        # index while their token rows are still intact (the persistent
+        # batch reuses the rows right below).
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.use_suffix_gpu()
+            and scheduler_output.finished_req_ids
+        ):
+            assert isinstance(self.drafter, SuffixProposerGPU)
+            self.drafter.on_requests_finished(
+                scheduler_output.finished_req_ids,
+                self.input_batch,
+                self.token_ids_gpu_tensor,
+            )
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
         # scheduled_req_ids overlap. This happens when a request is aborted and
@@ -1247,7 +1270,7 @@ class GPUModelRunner(
 
         is_ngram_gpu = (
             self.speculative_config is not None
-            and self.speculative_config.use_ngram_gpu()
+            and self.speculative_config.use_gpu_state_drafter()
         )
         if is_ngram_gpu:
             ngram_gpu_new_reqs: list[CachedRequestState] = []
@@ -1332,7 +1355,7 @@ class GPUModelRunner(
         original_num_spec_per_req: dict[str, int] = {}
         if (
             self.speculative_config is not None
-            and self.speculative_config.use_ngram_gpu()
+            and self.speculative_config.use_gpu_state_drafter()
         ):
             for req_id, toks in scheduled_spec_tokens.items():
                 original_num_spec_per_req[req_id] = len(toks)
@@ -4175,7 +4198,7 @@ class GPUModelRunner(
         # The replace is much faster than deepcopy.
         if (
             self.speculative_config is not None
-            and self.speculative_config.use_ngram_gpu()
+            and self.speculative_config.use_gpu_state_drafter()
         ):
             num_scheduled_tokens_copy = scheduler_output.num_scheduled_tokens.copy()
             spec_decode_tokens_copy = (
@@ -4666,10 +4689,10 @@ class GPUModelRunner(
                         # Prevent hang when DP ranks disagree on input_fits_in_drafter
                         self.drafter.dummy_run(num_tokens=1)
             elif (
-                spec_config.use_ngram_gpu()
+                spec_config.use_gpu_state_drafter()
                 and not spec_config.disable_padded_drafter_batch
             ):
-                assert isinstance(self.drafter, NgramProposerGPU)
+                assert isinstance(self.drafter, (NgramProposerGPU, SuffixProposerGPU))
                 sampled_token_ids = sampler_output.sampled_token_ids
                 if input_fits_in_drafter:
                     propose_draft_token_ids(sampled_token_ids)
@@ -5037,8 +5060,14 @@ class GPUModelRunner(
                 self.input_batch.token_ids_cpu,
                 slot_mappings=slot_mappings,
             )
-        elif spec_config.use_ngram_gpu():
-            assert isinstance(self.drafter, NgramProposerGPU)
+        elif spec_config.use_gpu_state_drafter():
+            assert isinstance(self.drafter, (NgramProposerGPU, SuffixProposerGPU))
+            if isinstance(self.drafter, SuffixProposerGPU):
+                # Host-side, off the draft path: feed in-flight responses
+                # into the cross-request global suffix index.
+                self.drafter.ingest_active_requests(
+                    self.input_batch, self.token_ids_gpu_tensor
+                )
             (
                 next_token_ids,
                 valid_sampled_tokens_count,
