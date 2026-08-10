@@ -6824,6 +6824,16 @@ class GPUModelRunner(
 
     @instrument(span_name="Capture model")
     def capture_model(self) -> int:
+        # The standalone suffix_gpu draft graph is independent of the
+        # model cudagraph mode; pre-capture it here so the first serving
+        # step doesn't pay Triton JIT + capture latency.
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.use_suffix_gpu()
+        ):
+            assert isinstance(self.drafter, SuffixProposerGPU)
+            self.drafter.capture_draft_graph(self.token_ids_gpu_tensor)
+
         if self.compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
             logger.warning(
                 "Skipping CUDA graph capture. To turn on CUDA graph capture, "

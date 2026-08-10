@@ -40,10 +40,12 @@ def _make_config(use_cuda_graph: bool) -> SimpleNamespace:
     )
 
 
-def _propose_repetition(proposer: SuffixProposerGPU):
+def _propose_repetition(proposer: SuffixProposerGPU,
+                        token_ids: torch.Tensor | None = None):
     """History ...[5,6,7,8]*3 then sampled [5]: expect draft [6,7,8,...]."""
-    token_ids = torch.zeros(MAX_NUM_SEQS, MAX_MODEL_LEN, dtype=torch.int32,
-                            device=DEVICE)
+    if token_ids is None:
+        token_ids = torch.zeros(MAX_NUM_SEQS, MAX_MODEL_LEN,
+                                dtype=torch.int32, device=DEVICE)
     hist = [5, 6, 7, 8] * 3
     token_ids[0, :len(hist)] = torch.tensor(hist, dtype=torch.int32)
     num_tokens = torch.zeros(MAX_NUM_SEQS, dtype=torch.int32, device=DEVICE)
@@ -79,6 +81,32 @@ def test_graph_and_eager_agree():
     d_g, nv_g, _ = _propose_repetition(SuffixProposerGPU(cfg_g, DEVICE))
     assert torch.equal(nv_e, nv_g)
     assert torch.equal(d_e, d_g)
+
+
+def test_capture_draft_graph_at_warmup():
+    """Pre-capture (capture_model hook) replays on the same buffer."""
+    proposer = SuffixProposerGPU(_make_config(True), DEVICE)
+    persistent = torch.zeros(MAX_NUM_SEQS, MAX_MODEL_LEN, dtype=torch.int32,
+                             device=DEVICE)
+    proposer.capture_draft_graph(persistent)
+    assert proposer._graph is not None
+    # Warmup runs on scratch buffers: the persistent buffer stays clean.
+    assert int(persistent.abs().sum()) == 0
+
+    graph = proposer._graph
+    d_g, nv_g, _ = _propose_repetition(proposer, persistent)
+    assert proposer._graph is graph  # replayed, not re-captured
+    assert int(persistent[0, 12]) == 5  # graph scattered the sampled id
+
+    d_e, nv_e, _ = _propose_repetition(SuffixProposerGPU(_make_config(False),
+                                                         DEVICE))
+    assert torch.equal(nv_e, nv_g)
+    assert torch.equal(d_e, d_g)
+
+    # A buffer with different storage must fall back to eager, safely.
+    d_f, nv_f, _ = _propose_repetition(proposer)
+    assert torch.equal(nv_e, nv_f)
+    assert torch.equal(d_e, d_f)
 
 
 def test_ingest_and_cross_request_draft():
