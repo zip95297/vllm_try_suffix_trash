@@ -94,6 +94,38 @@ class SuffixProposerGPU:
         torch.cuda.synchronize(self.device)
         self._warmed_up = True
 
+    def capture_draft_graph(self, token_ids_gpu: torch.Tensor) -> None:
+        """Warm up and capture the draft graph on the persistent buffer.
+
+        Called by the runner during engine warmup (capture_model) so the
+        first serving step doesn't pay Triton JIT + capture latency;
+        propose() also calls it lazily as a fallback (e.g. enforce_eager
+        engines, where capture_model never runs).
+        """
+        if (not self.use_cuda_graph or self._graph is not None
+                or self._graph_failed):
+            return
+        if self.device.type != "cuda":
+            self._graph_failed = True
+            return
+        if not self._warmed_up:
+            self._warmup(token_ids_gpu)
+        full = self._full_alias(token_ids_gpu)
+        if full is None:
+            self._graph_failed = True
+            return
+        try:
+            # Always capture at the maximum sampled width
+            # (num_spec_tokens + 1); narrower per-step inputs are
+            # left-aligned into the staging buffer.
+            self._capture(full, self.k + 1)
+        except Exception:
+            logger.exception(
+                "suffix_gpu: CUDA graph capture failed; "
+                "falling back to eager kernels.")
+            self._graph_failed = True
+            self._graph = None
+
     def _capture(self, token_ids_gpu: torch.Tensor,
                  sampled_width: int) -> None:
         """Capture update+propose on fixed max-batch buffers.
@@ -150,21 +182,8 @@ class SuffixProposerGPU:
                      and bs <= self.max_num_seqs
                      and width <= self.k + 1)
         if use_graph and self._graph is None:
-            full = self._full_alias(token_ids_gpu)
-            if full is None:
-                self._graph_failed = True
-            else:
-                try:
-                    # Always capture at the maximum sampled width
-                    # (num_spec_tokens + 1); narrower per-step inputs
-                    # are left-aligned into the staging buffer.
-                    self._capture(full, self.k + 1)
-                except Exception:
-                    logger.exception(
-                        "suffix_gpu: CUDA graph capture failed; "
-                        "falling back to eager kernels.")
-                    self._graph_failed = True
-                    self._graph = None
+            # Fallback for engines that never ran capture_model.
+            self.capture_draft_graph(token_ids_gpu)
         if (self._graph is not None and use_graph
                 and token_ids_gpu.data_ptr() == self._g_token_ids.data_ptr()
                 and token_ids_gpu.stride(0) == self._g_token_ids.stride(0)):
