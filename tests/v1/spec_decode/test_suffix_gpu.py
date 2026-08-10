@@ -109,6 +109,20 @@ def test_capture_draft_graph_at_warmup():
     assert torch.equal(d_e, d_f)
 
 
+def test_capture_draft_graph_warms_up_without_graph():
+    """With the graph disabled, warmup (Triton JIT) still runs at startup."""
+    proposer = SuffixProposerGPU(_make_config(False), DEVICE)
+    persistent = torch.zeros(MAX_NUM_SEQS, MAX_MODEL_LEN, dtype=torch.int32,
+                             device=DEVICE)
+    proposer.capture_draft_graph(persistent)
+    assert proposer._warmed_up
+    assert proposer._graph is None
+    d, nv, _ = _propose_repetition(proposer, persistent)
+    n = int(nv[0])
+    assert n > 0
+    assert d[0, :n].tolist() == ([6, 7, 8, 5] * 3)[:n]
+
+
 def test_ingest_and_cross_request_draft():
     proposer = SuffixProposerGPU(_make_config(False), DEVICE)
     token_ids = torch.zeros(MAX_NUM_SEQS, MAX_MODEL_LEN, dtype=torch.int32,

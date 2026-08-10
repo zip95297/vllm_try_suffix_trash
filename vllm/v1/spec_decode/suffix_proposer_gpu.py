@@ -95,21 +95,22 @@ class SuffixProposerGPU:
         self._warmed_up = True
 
     def capture_draft_graph(self, token_ids_gpu: torch.Tensor) -> None:
-        """Warm up and capture the draft graph on the persistent buffer.
+        """Warm up (Triton JIT) and capture the draft graph.
 
         Called by the runner during engine warmup (capture_model) so the
-        first serving step doesn't pay Triton JIT + capture latency;
-        propose() also calls it lazily as a fallback (e.g. enforce_eager
-        engines, where capture_model never runs).
+        first serving step doesn't pay JIT + capture latency; propose()
+        also calls it lazily as a fallback (e.g. enforce_eager engines,
+        where capture_model never runs). Warmup runs even when the CUDA
+        graph is disabled — only the capture itself is gated.
         """
-        if (not self.use_cuda_graph or self._graph is not None
-                or self._graph_failed):
-            return
         if self.device.type != "cuda":
             self._graph_failed = True
             return
         if not self._warmed_up:
             self._warmup(token_ids_gpu)
+        if (not self.use_cuda_graph or self._graph is not None
+                or self._graph_failed):
+            return
         full = self._full_alias(token_ids_gpu)
         if full is None:
             self._graph_failed = True
