@@ -147,19 +147,24 @@ class SuffixProposerGPU:
         width = valid_sampled_token_ids_gpu.shape[1]
 
         use_graph = (self.use_cuda_graph and not self._graph_failed
-                     and token_ids_gpu.shape[0] == self.max_num_seqs)
+                     and bs <= self.max_num_seqs)
         if use_graph and self._graph is None:
-            try:
-                self._capture(token_ids_gpu, width)
-            except Exception:
-                logger.exception(
-                    "suffix_gpu: CUDA graph capture failed; "
-                    "falling back to eager kernels.")
+            full = self._full_alias(token_ids_gpu)
+            if full is None:
                 self._graph_failed = True
-                self._graph = None
+            else:
+                try:
+                    self._capture(full, width)
+                except Exception:
+                    logger.exception(
+                        "suffix_gpu: CUDA graph capture failed; "
+                        "falling back to eager kernels.")
+                    self._graph_failed = True
+                    self._graph = None
         if (self._graph is not None and use_graph
-                and self._g_token_ids is token_ids_gpu
-                and self._g_sampled.shape[1] == width):
+                and self._g_sampled.shape[1] == width
+                and token_ids_gpu.data_ptr() == self._g_token_ids.data_ptr()
+                and token_ids_gpu.stride(0) == self._g_token_ids.stride(0)):
             self._g_num_tokens[:bs].copy_(num_tokens_no_spec)
             self._g_num_tokens[bs:].zero_()
             self._g_sampled[:bs].copy_(valid_sampled_token_ids_gpu)
@@ -174,6 +179,25 @@ class SuffixProposerGPU:
             valid_sampled_token_ids_gpu, valid_sampled_tokens_count,
             max_model_len=self.max_model_len)
         return draft, num_valid
+
+    def _full_alias(self, view: torch.Tensor) -> torch.Tensor | None:
+        """Max-batch alias of the persistent buffer backing `view`.
+
+        The runner passes token_ids_gpu_tensor[:batch_size], a fresh
+        slice each step; the graph must bind the full buffer so any
+        later batch size replays correctly.
+        """
+        s = view.shape[1]
+        stride0 = view.stride(0)
+        rows = self.max_num_seqs
+        needed = (rows - 1) * stride0 + s
+        cap = view.untyped_storage().size() // view.element_size()
+        if view.stride(1) != 1 or view.storage_offset() != 0 or cap < needed:
+            logger.warning_once(
+                "suffix_gpu: token buffer layout unsuitable for CUDA "
+                "graph capture; using eager kernels.")
+            return None
+        return torch.as_strided(view, (rows, s), (stride0, 1))
 
     # ------------------------------------------------------------------
     # global-memory ingestion (host-side, off the draft path)
