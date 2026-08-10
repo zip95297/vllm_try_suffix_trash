@@ -6353,6 +6353,17 @@ class GPUModelRunner(
                 logits,
                 dummy_metadata,
             )
+            # Also warm the all-greedy path: it launches
+            # rejection_greedy_sample_kernel with is_greedy_ptr=None, a
+            # different Triton specialization than the mixed-batch call
+            # above (see the FIXME in rejection_sampler.py), so without
+            # this the first real temperature=0 spec step JIT-compiles.
+            self.rejection_sampler(
+                dummy_spec_decode_metadata,
+                None,
+                logits,
+                replace(dummy_metadata, all_greedy=True),
+            )
         return sampler_output
 
     def _dummy_pooler_run_task(
