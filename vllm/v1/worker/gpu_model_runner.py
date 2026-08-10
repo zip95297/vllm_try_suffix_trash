@@ -614,9 +614,14 @@ class GPUModelRunner(
                     self.drafter = NgramProposerGPU(
                         self.vllm_config, self.device, self
                     )
-                else:
+                elif self.speculative_config.use_suffix_gpu():
                     self.drafter = SuffixProposerGPU(
                         self.vllm_config, self.device, self
+                    )
+                else:
+                    raise ValueError(
+                        "Unsupported GPU-state drafter method: "
+                        f"{self.speculative_config.method}"
                     )
                 self.num_tokens_no_spec_gpu = torch.zeros(
                     self.max_num_reqs, dtype=torch.int32, device=device
