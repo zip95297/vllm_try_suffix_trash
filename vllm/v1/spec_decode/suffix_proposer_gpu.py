@@ -147,14 +147,18 @@ class SuffixProposerGPU:
         width = valid_sampled_token_ids_gpu.shape[1]
 
         use_graph = (self.use_cuda_graph and not self._graph_failed
-                     and bs <= self.max_num_seqs)
+                     and bs <= self.max_num_seqs
+                     and width <= self.k + 1)
         if use_graph and self._graph is None:
             full = self._full_alias(token_ids_gpu)
             if full is None:
                 self._graph_failed = True
             else:
                 try:
-                    self._capture(full, width)
+                    # Always capture at the maximum sampled width
+                    # (num_spec_tokens + 1); narrower per-step inputs
+                    # are left-aligned into the staging buffer.
+                    self._capture(full, self.k + 1)
                 except Exception:
                     logger.exception(
                         "suffix_gpu: CUDA graph capture failed; "
@@ -162,13 +166,12 @@ class SuffixProposerGPU:
                     self._graph_failed = True
                     self._graph = None
         if (self._graph is not None and use_graph
-                and self._g_sampled.shape[1] == width
                 and token_ids_gpu.data_ptr() == self._g_token_ids.data_ptr()
                 and token_ids_gpu.stride(0) == self._g_token_ids.stride(0)):
             self._g_num_tokens[:bs].copy_(num_tokens_no_spec)
             self._g_num_tokens[bs:].zero_()
-            self._g_sampled[:bs].copy_(valid_sampled_token_ids_gpu)
-            self._g_sampled[bs:].fill_(-1)
+            self._g_sampled.fill_(-1)
+            self._g_sampled[:bs, :width].copy_(valid_sampled_token_ids_gpu)
             self._g_counts[:bs].copy_(valid_sampled_tokens_count)
             self._g_counts[bs:].zero_()
             self._graph.replay()
