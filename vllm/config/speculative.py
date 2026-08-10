@@ -1426,7 +1426,9 @@ class SpeculativeConfig:
             if method
             in (
                 "ngram",
+                "ngram_gpu",
                 "suffix",
+                "suffix_gpu",
                 "extract_hidden_states",
                 "custom_class",
             )
