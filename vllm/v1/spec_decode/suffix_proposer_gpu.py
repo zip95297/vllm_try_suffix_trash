@@ -215,7 +215,7 @@ class SuffixProposerGPU:
         self._graph_buckets = buckets
         logger.info_once("suffix_gpu: draft path captured into CUDA "
                          "graphs (buckets=%s, sampled_width=%d)",
-                         buckets, sampled_width)
+                         str(buckets), sampled_width)
 
     def propose(
         self,
