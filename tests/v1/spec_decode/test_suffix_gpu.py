@@ -71,7 +71,9 @@ def test_propose_drafts_repetition(use_cuda_graph):
     # Rows with no sampled tokens must not draft.
     assert int(nv[1]) == 0
     if use_cuda_graph:
-        assert proposer._graph is not None
+        assert proposer._graphs
+        # Buckets are powers of two up to max_num_seqs.
+        assert proposer._graph_buckets == [1, 2, 4, 8]
 
 
 def test_graph_and_eager_agree():
@@ -89,13 +91,14 @@ def test_capture_draft_graph_at_warmup():
     persistent = torch.zeros(MAX_NUM_SEQS, MAX_MODEL_LEN, dtype=torch.int32,
                              device=DEVICE)
     proposer.capture_draft_graph(persistent)
-    assert proposer._graph is not None
+    assert proposer._graphs
     # Warmup runs on scratch buffers: the persistent buffer stays clean.
     assert int(persistent.abs().sum()) == 0
 
-    graph = proposer._graph
+    graphs = {b: g for b, (g, _, _) in proposer._graphs.items()}
     d_g, nv_g, _ = _propose_repetition(proposer, persistent)
-    assert proposer._graph is graph  # replayed, not re-captured
+    # Replayed, not re-captured: same graph objects per bucket.
+    assert {b: g for b, (g, _, _) in proposer._graphs.items()} == graphs
     assert int(persistent[0, 12]) == 5  # graph scattered the sampled id
 
     d_e, nv_e, _ = _propose_repetition(SuffixProposerGPU(_make_config(False),
@@ -116,7 +119,7 @@ def test_capture_draft_graph_warms_up_without_graph():
                              device=DEVICE)
     proposer.capture_draft_graph(persistent)
     assert proposer._warmed_up
-    assert proposer._graph is None
+    assert not proposer._graphs
     d, nv, _ = _propose_repetition(proposer, persistent)
     n = int(nv[0])
     assert n > 0

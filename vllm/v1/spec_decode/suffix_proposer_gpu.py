@@ -11,9 +11,10 @@ scheduling (no host sync on the draft path).
 
 The draft path runs eagerly (fused Triton kernels) by default at first
 call; when ``suffix_gpu_use_cuda_graph`` is enabled the whole
-update+propose chain is captured once into a CUDA graph on fixed
-max-batch buffers and replayed each step, falling back to eager if
-capture fails.
+update+propose chain is captured into per-batch-bucket CUDA graphs
+(powers of two up to max_num_seqs) on shared staging buffers, and each
+step replays the smallest bucket covering the batch, falling back to
+eager if capture fails.
 """
 
 import torch
@@ -61,16 +62,20 @@ class SuffixProposerGPU:
             min_token_prob=config.suffix_decoding_min_token_prob,
         )
 
-        # CUDA-graph state (captured lazily on the first propose call,
-        # after eager warmup has JIT-compiled the Triton kernels).
-        self._graph: torch.cuda.CUDAGraph | None = None
+        # CUDA-graph state (captured at engine warmup, or lazily on the
+        # first propose call after eager warmup has JIT-compiled the
+        # Triton kernels). One graph per batch bucket so small batches
+        # do not replay max-batch kernels; all buckets share the
+        # max-batch staging buffers below.
+        self._graphs: dict[
+            int, tuple[torch.cuda.CUDAGraph, torch.Tensor, torch.Tensor]
+        ] = {}
+        self._graph_buckets: list[int] = []
         self._graph_failed = False
         self._g_num_tokens: torch.Tensor | None = None
         self._g_sampled: torch.Tensor | None = None
         self._g_counts: torch.Tensor | None = None
         self._g_token_ids: torch.Tensor | None = None
-        self._g_draft: torch.Tensor | None = None
-        self._g_nv: torch.Tensor | None = None
 
         self._warmed_up = False
 
@@ -131,7 +136,7 @@ class SuffixProposerGPU:
         self._warmed_up = True
 
     def capture_draft_graph(self, token_ids_gpu: torch.Tensor) -> None:
-        """Warm up (Triton JIT) and capture the draft graph.
+        """Warm up (Triton JIT) and capture the draft graphs.
 
         Called by the runner during engine warmup (capture_model) so the
         first serving step doesn't pay JIT + capture latency; propose()
@@ -144,7 +149,7 @@ class SuffixProposerGPU:
             return
         if not self._warmed_up:
             self._warmup(token_ids_gpu)
-        if (not self.use_cuda_graph or self._graph is not None
+        if (not self.use_cuda_graph or self._graphs
                 or self._graph_failed):
             return
         full = self._full_alias(token_ids_gpu)
@@ -155,39 +160,62 @@ class SuffixProposerGPU:
             # Always capture at the maximum sampled width
             # (num_spec_tokens + 1); narrower per-step inputs are
             # left-aligned into the staging buffer.
-            self._capture(full, self.k + 1)
+            self._capture_buckets(full, self.k + 1)
         except Exception:
             logger.exception(
                 "suffix_gpu: CUDA graph capture failed; "
                 "falling back to eager kernels.")
             self._graph_failed = True
-            self._graph = None
+            self._graphs = {}
+            self._graph_buckets = []
 
-    def _capture(self, token_ids_gpu: torch.Tensor,
-                 sampled_width: int) -> None:
-        """Capture update+propose on fixed max-batch buffers.
+    @staticmethod
+    def _bucket_sizes(max_batch: int) -> list[int]:
+        sizes = []
+        b = 1
+        while b < max_batch:
+            sizes.append(b)
+            b *= 2
+        sizes.append(max_batch)
+        return sizes
 
-        token_ids_gpu is the runner's persistent buffer, so the graph
-        binds its storage directly; per-step inputs are staged into
-        fixed buffers before replay.
+    def _capture_buckets(self, token_ids_gpu: torch.Tensor,
+                         sampled_width: int) -> None:
+        """Capture update+propose per batch bucket on shared buffers.
+
+        token_ids_gpu is the runner's persistent buffer, so the graphs
+        bind its storage directly; per-step inputs are staged into the
+        shared fixed buffers before replay.
         """
-        b = self.max_num_seqs
-        self._g_num_tokens = torch.zeros(b, dtype=torch.int32,
+        b_max = self.max_num_seqs
+        self._g_num_tokens = torch.zeros(b_max, dtype=torch.int32,
                                          device=self.device)
-        self._g_sampled = torch.full((b, sampled_width), -1,
+        self._g_sampled = torch.full((b_max, sampled_width), -1,
                                      dtype=torch.int32, device=self.device)
-        self._g_counts = torch.zeros(b, dtype=torch.int64,
+        self._g_counts = torch.zeros(b_max, dtype=torch.int64,
                                      device=self.device)
         self._g_token_ids = token_ids_gpu
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            self._g_draft, self._g_nv, _ = self.drafter.propose_with_update(
-                self._g_num_tokens, self._g_token_ids, self._g_sampled,
-                self._g_counts, max_model_len=self.max_model_len)
-        self._graph = graph
-        logger.info_once("suffix_gpu: draft path captured into CUDA graph "
-                         "(max_batch=%d, sampled_width=%d)", b,
-                         sampled_width)
+        buckets = self._bucket_sizes(b_max)
+        # Eagerly warm every bucket shape first: Triton JIT inside a
+        # capture would invalidate it.
+        for b in buckets:
+            self.drafter.propose_with_update(
+                self._g_num_tokens[:b], self._g_token_ids[:b],
+                self._g_sampled[:b], self._g_counts[:b],
+                max_model_len=self.max_model_len)
+        torch.cuda.synchronize(self.device)
+        for b in buckets:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                draft, nv, _ = self.drafter.propose_with_update(
+                    self._g_num_tokens[:b], self._g_token_ids[:b],
+                    self._g_sampled[:b], self._g_counts[:b],
+                    max_model_len=self.max_model_len)
+            self._graphs[b] = (graph, draft, nv)
+        self._graph_buckets = buckets
+        logger.info_once("suffix_gpu: draft path captured into CUDA "
+                         "graphs (buckets=%s, sampled_width=%d)",
+                         buckets, sampled_width)
 
     def propose(
         self,
@@ -220,20 +248,22 @@ class SuffixProposerGPU:
         use_graph = (self.use_cuda_graph and not self._graph_failed
                      and bs <= self.max_num_seqs
                      and width <= self.k + 1)
-        if use_graph and self._graph is None:
+        if use_graph and not self._graphs:
             # Fallback for engines that never ran capture_model.
             self.capture_draft_graph(token_ids_gpu)
-        if (self._graph is not None and use_graph
+        if (self._graphs and use_graph
                 and token_ids_gpu.data_ptr() == self._g_token_ids.data_ptr()
                 and token_ids_gpu.stride(0) == self._g_token_ids.stride(0)):
+            b = next(s for s in self._graph_buckets if s >= bs)
+            graph, g_draft, g_nv = self._graphs[b]
             self._g_num_tokens[:bs].copy_(num_tokens_no_spec)
-            self._g_num_tokens[bs:].zero_()
-            self._g_sampled.fill_(-1)
+            self._g_num_tokens[bs:b].zero_()
+            self._g_sampled[:b].fill_(-1)
             self._g_sampled[:bs, :width].copy_(valid_sampled_token_ids_gpu)
             self._g_counts[:bs].copy_(valid_sampled_tokens_count)
-            self._g_counts[bs:].zero_()
-            self._graph.replay()
-            return self._g_draft[:bs], self._g_nv[:bs]
+            self._g_counts[bs:b].zero_()
+            graph.replay()
+            return g_draft[:bs], g_nv[:bs]
 
         draft, num_valid, _ = self.drafter.propose_with_update(
             num_tokens_no_spec, token_ids_gpu,
