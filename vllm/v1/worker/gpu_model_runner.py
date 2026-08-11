@@ -268,6 +268,7 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         vocab_size: int,
         routed_experts: RoutedExpertsTensors | None = None,
         check_ep_fault: bool = False,
+        copy_wait_event: torch.cuda.Event | None = None,
     ):
         self._model_runner_output = model_runner_output
         self._invalid_req_indices = invalid_req_indices
@@ -287,7 +288,17 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         # Initiate the copy on a separate stream, but do not synchronize it.
         default_stream = torch.cuda.current_stream()
         with torch.cuda.stream(async_output_copy_stream):
-            async_output_copy_stream.wait_stream(default_stream)
+            if (
+                copy_wait_event is not None
+                and routed_experts is None
+                and not check_ep_fault
+            ):
+                # Sampler outputs are final at the recorded event; do not
+                # serialize the D2H behind later default-stream work
+                # (e.g. the GPU drafter pipeline).
+                async_output_copy_stream.wait_event(copy_wait_event)
+            else:
+                async_output_copy_stream.wait_stream(default_stream)
             self.sampled_token_ids_cpu = self._sampled_token_ids.to(
                 "cpu", non_blocking=True
             )
@@ -638,6 +649,10 @@ class GPUModelRunner(
                 self._ngram_pinned_val_buf = torch.zeros(
                     self.max_num_reqs, dtype=torch.int32, pin_memory=True
                 )
+                self._ngram_pinned_prompt_buf = torch.zeros(
+                    self.max_model_len, dtype=torch.int32, pin_memory=True
+                )
+                self._ngram_pinned_prompt_event = torch.cuda.Event()
             elif self.speculative_config.use_gemma4_mtp():
                 self.drafter = Gemma4Proposer(self.vllm_config, self.device, self)
             elif self.speculative_config.use_step3p5_mtp():
@@ -901,6 +916,8 @@ class GPUModelRunner(
         # Per-step padded-slot trim counts (see update_scheduler_for_
         # invalid_drafts), reported via ModelRunnerOutput for metrics.
         self._last_num_invalid_spec_tokens: dict[str, int] | None = None
+        # Reusable marker: sampler outputs final, drafting not yet enqueued.
+        self._sampler_ready_event: torch.cuda.Event | None = None
         if (
             self.speculative_config is not None
             and self.speculative_config.use_gpu_state_drafter()
@@ -1545,6 +1562,10 @@ class GPUModelRunner(
 
         # Incrementally update ngram_gpu tensors after batch is stable
         if is_ngram_gpu:
+            if isinstance(self.drafter, SuffixProposerGPU):
+                # Reused rows must not be overwritten before pending
+                # global-index ingest reads (side stream) complete.
+                self.drafter.sync_pending_ingest()
             update_ngram_gpu_tensors_incremental(
                 self.input_batch,
                 self.token_ids_gpu_tensor,
@@ -1553,6 +1574,8 @@ class GPUModelRunner(
                 self.device,
                 _pinned_idx_buf=self._ngram_pinned_idx_buf,
                 _pinned_val_buf=self._ngram_pinned_val_buf,
+                _pinned_prompt_buf=self._ngram_pinned_prompt_buf,
+                _pinned_prompt_event=self._ngram_pinned_prompt_event,
             )
 
         if deferred_spec_decode_corrections:
@@ -4649,6 +4672,7 @@ class GPUModelRunner(
 
         spec_config = self.speculative_config
         draft_after_bookkeeping = False
+        sampler_ready_event: torch.cuda.Event | None = None
         if spec_config is not None:
             # Decide whether to run the drafter or zero out draft tokens.
             input_fits_in_drafter = self._input_fits_in_drafter(
@@ -4702,6 +4726,14 @@ class GPUModelRunner(
             ):
                 assert isinstance(self.drafter, (NgramProposerGPU, SuffixProposerGPU))
                 sampled_token_ids = sampler_output.sampled_token_ids
+                if self.use_async_scheduling:
+                    # Sampler outputs are final here; mark the spot so the
+                    # async output D2H need not wait for the draft pipeline
+                    # enqueued below.
+                    if self._sampler_ready_event is None:
+                        self._sampler_ready_event = torch.cuda.Event()
+                    self._sampler_ready_event.record()
+                    sampler_ready_event = self._sampler_ready_event
                 if input_fits_in_drafter:
                     propose_draft_token_ids(sampled_token_ids)
                 elif self.valid_sampled_token_count_event is not None:
@@ -4852,6 +4884,7 @@ class GPUModelRunner(
                 vocab_size=self.input_batch.vocab_size,
                 routed_experts=routed_experts_snapshot,
                 check_ep_fault=self.check_ep_fault,
+                copy_wait_event=sampler_ready_event,
             )
         with record_function_or_nullcontext(
             "gpu_model_runner: set_async_sampled_token_ids"

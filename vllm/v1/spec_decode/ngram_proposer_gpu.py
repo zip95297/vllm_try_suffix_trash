@@ -523,6 +523,47 @@ def update_scheduler_for_invalid_drafts(
     return num_invalid_spec_tokens
 
 
+def _copy_new_request_rows(
+    input_batch: InputBatch,
+    token_ids_gpu_tensor: torch.Tensor,
+    row_indices: list[int],
+    _pinned_prompt_buf: torch.Tensor | None,
+    _pinned_prompt_event: torch.cuda.Event | None,
+) -> None:
+    """H2D-copy full token rows for new/resumed requests.
+
+    Stages rows through a resident pinned buffer when available:
+    per-request ``.pin_memory()`` pays a cudaHostAlloc plus a
+    synchronous pageable copy (millisecond-scale) that lands directly
+    in the request's TTFT.
+    """
+    offset = 0
+    staged = False
+    cap = _pinned_prompt_buf.numel() if _pinned_prompt_buf is not None else 0
+    for idx in row_indices:
+        num_tokens = int(input_batch.num_tokens_no_spec[idx])
+        if num_tokens <= 0:
+            continue
+        src = input_batch.token_ids_cpu_tensor[idx, :num_tokens]
+        if _pinned_prompt_buf is None or offset + num_tokens > cap:
+            token_ids_gpu_tensor[idx, :num_tokens].copy_(
+                src.pin_memory(), non_blocking=True
+            )
+            continue
+        if not staged:
+            # The previous step's H2D from this buffer must finish
+            # before the host rewrites it.
+            if _pinned_prompt_event is not None:
+                _pinned_prompt_event.synchronize()
+            staged = True
+        stage = _pinned_prompt_buf[offset : offset + num_tokens]
+        stage.copy_(src)
+        token_ids_gpu_tensor[idx, :num_tokens].copy_(stage, non_blocking=True)
+        offset += num_tokens
+    if staged and _pinned_prompt_event is not None:
+        _pinned_prompt_event.record()
+
+
 def update_ngram_gpu_tensors_incremental(
     input_batch: InputBatch,
     token_ids_gpu_tensor: torch.Tensor,
@@ -531,6 +572,8 @@ def update_ngram_gpu_tensors_incremental(
     device: torch.device,
     _pinned_idx_buf: torch.Tensor,
     _pinned_val_buf: torch.Tensor,
+    _pinned_prompt_buf: torch.Tensor | None = None,
+    _pinned_prompt_event: torch.cuda.Event | None = None,
 ) -> None:
     """Incrementally update token_ids_gpu_tensor and num_tokens_no_spec_gpu
     for ngram GPU proposer.
@@ -554,13 +597,13 @@ def update_ngram_gpu_tensors_incremental(
 
     # First run, no previous state.
     if prev_req_id_to_index is None:
-        for idx in active_indices:
-            num_tokens = input_batch.num_tokens_no_spec[idx]
-            if num_tokens > 0:
-                token_ids_gpu_tensor[idx, :num_tokens].copy_(
-                    input_batch.token_ids_cpu_tensor[idx, :num_tokens].pin_memory(),
-                    non_blocking=True,
-                )
+        _copy_new_request_rows(
+            input_batch,
+            token_ids_gpu_tensor,
+            active_indices,
+            _pinned_prompt_buf,
+            _pinned_prompt_event,
+        )
 
         _sync_num_tokens(
             input_batch,
@@ -596,17 +639,18 @@ def update_ngram_gpu_tensors_incremental(
         num_tokens_no_spec_gpu[dst_tensor] = temp_num_tokens
 
     # Full copy for new/resumed requests.
-    for req_state in new_reqs:
-        new_req_idx = curr_req_id_to_index.get(req_state.req_id)
-        if new_req_idx is None:
-            continue
-
-        num_tokens = input_batch.num_tokens_no_spec[new_req_idx]
-        if num_tokens > 0:
-            token_ids_gpu_tensor[new_req_idx, :num_tokens].copy_(
-                input_batch.token_ids_cpu_tensor[new_req_idx, :num_tokens].pin_memory(),
-                non_blocking=True,
-            )
+    new_rows = [
+        idx
+        for req_state in new_reqs
+        if (idx := curr_req_id_to_index.get(req_state.req_id)) is not None
+    ]
+    _copy_new_request_rows(
+        input_batch,
+        token_ids_gpu_tensor,
+        new_rows,
+        _pinned_prompt_buf,
+        _pinned_prompt_event,
+    )
 
     # Always batch-sync sequence lengths from CPU for ALL active requests.
     _sync_num_tokens(

@@ -74,9 +74,45 @@ class SuffixProposerGPU:
 
         self._warmed_up = False
 
+        # Global-index ingestion runs on a side stream so its delta
+        # copies stay off the step critical path; sync_pending_ingest()
+        # orders later default-stream work after the pending reads.
+        self._ingest_stream: torch.cuda.Stream | None = None
+        self._ingest_event: torch.cuda.Event | None = None
+        self._ingest_pending = False
+        if device.type == "cuda" and self.drafter.global_index is not None:
+            self._ingest_stream = torch.cuda.Stream(device)
+            self._ingest_event = torch.cuda.Event()
+
     # Reuse NgramProposerGPU's device-side bookkeeping helper verbatim
     # (it only depends on self.device).
     update_token_ids_ngram = NgramProposerGPU.update_token_ids_ngram
+
+    def _ingest_async(self, keys: list, rows: list[torch.Tensor],
+                      lengths: list[int], final: bool = False) -> None:
+        if self._ingest_stream is None:
+            self.drafter.ingest_active(keys, rows, lengths, final=final,
+                                       chunk=self.ingest_chunk)
+            return
+        default_stream = torch.cuda.current_stream()
+        with torch.cuda.stream(self._ingest_stream):
+            # Token rows are written on the default stream.
+            self._ingest_stream.wait_stream(default_stream)
+            self.drafter.ingest_active(keys, rows, lengths, final=final,
+                                       chunk=self.ingest_chunk)
+            self._ingest_event.record()
+        self._ingest_pending = True
+
+    def sync_pending_ingest(self) -> None:
+        """Order later default-stream work after pending ingest reads.
+
+        Must run before rewriting ingested token rows (row reuse after
+        request finish) and before querying the global index (graph
+        replay / eager propose).
+        """
+        if self._ingest_pending:
+            torch.cuda.current_stream().wait_event(self._ingest_event)
+            self._ingest_pending = False
 
     def _warmup(self, token_ids_gpu: torch.Tensor) -> None:
         """JIT-compile the Triton kernels on dummy max-shape data."""
@@ -172,6 +208,8 @@ class SuffixProposerGPU:
 
         # Host-side upkeep: swap in finished background SA rebuilds.
         self.drafter.poll()
+        # Global-index queries below must see pending side-stream ingest.
+        self.sync_pending_ingest()
 
         if not self._warmed_up:
             self._warmup(token_ids_gpu)
@@ -244,8 +282,7 @@ class SuffixProposerGPU:
             rows.append(token_ids_gpu[idx, start:start + resp_len])
             lengths.append(resp_len)
         if keys:
-            self.drafter.ingest_active(keys, rows, lengths,
-                                       chunk=self.ingest_chunk)
+            self._ingest_async(keys, rows, lengths)
 
     def on_requests_finished(self, finished_req_ids, input_batch: InputBatch,
                              token_ids_gpu: torch.Tensor) -> None:
@@ -268,8 +305,7 @@ class SuffixProposerGPU:
             rows.append(token_ids_gpu[idx, start:start + max(resp_len, 0)])
             lengths.append(max(resp_len, 0))
         if keys:
-            self.drafter.ingest_active(keys, rows, lengths, final=True,
-                                       chunk=self.ingest_chunk)
+            self._ingest_async(keys, rows, lengths, final=True)
 
     def load_model(self, *args, **kwargs) -> None:
         pass
