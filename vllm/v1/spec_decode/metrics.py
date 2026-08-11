@@ -27,6 +27,11 @@ class SpecDecodingStats:
     num_drafts: int = 0
     num_draft_tokens: int = 0
     num_accepted_tokens: int = 0
+    # Draft tokens excluding padded placeholder slots (GPU-state
+    # drafters schedule fixed-k slots; invalid ones are trimmed on the
+    # worker and reported back). Equals num_draft_tokens for methods
+    # without padding.
+    num_real_draft_tokens: int = 0
     num_accepted_tokens_per_pos: list[int] = field(default_factory=list)
     num_draft_tokens_per_pos: list[int] = field(default_factory=list)
 
@@ -38,10 +43,16 @@ class SpecDecodingStats:
             num_draft_tokens_per_pos=[0] * num_spec_tokens,
         )
 
-    def observe_draft(self, num_draft_tokens: int, num_accepted_tokens: int):
+    def observe_draft(
+        self,
+        num_draft_tokens: int,
+        num_accepted_tokens: int,
+        num_invalid_tokens: int = 0,
+    ):
         self.num_drafts += 1
         self.num_draft_tokens += num_draft_tokens
         self.num_accepted_tokens += num_accepted_tokens
+        self.num_real_draft_tokens += max(num_draft_tokens - num_invalid_tokens, 0)
         assert num_accepted_tokens <= self.num_spec_tokens
         for i in range(num_accepted_tokens):
             self.num_accepted_tokens_per_pos[i] += 1
@@ -68,6 +79,7 @@ class SpecDecodingLogging:
         self.num_drafts: list[int] = []
         self.num_draft_tokens: list[int] = []
         self.num_accepted_tokens: list[int] = []
+        self.num_real_draft_tokens: list[int] = []
         self.accepted_tokens_per_pos_lists: list[list[int]] = []
         self.last_log_time = time.monotonic()
 
@@ -75,6 +87,7 @@ class SpecDecodingLogging:
         self.num_drafts.append(spec_decoding_stats.num_drafts)
         self.num_draft_tokens.append(spec_decoding_stats.num_draft_tokens)
         self.num_accepted_tokens.append(spec_decoding_stats.num_accepted_tokens)
+        self.num_real_draft_tokens.append(spec_decoding_stats.num_real_draft_tokens)
         self.accepted_tokens_per_pos_lists.append(
             spec_decoding_stats.num_accepted_tokens_per_pos
         )
@@ -109,6 +122,12 @@ class SpecDecodingLogging:
             if num_draft_tokens > 0
             else float("nan")
         )
+        num_real_draft_tokens = np.sum(self.num_real_draft_tokens)
+        real_draft_acceptance_rate = (
+            num_accepted_tokens / num_real_draft_tokens * 100
+            if num_real_draft_tokens > 0
+            else float("nan")
+        )
 
         # Conventionally, mean acceptance length includes the bonus token
         mean_acceptance_length = 1 + (num_accepted_tokens / num_drafts)
@@ -124,15 +143,19 @@ class SpecDecodingLogging:
             "Drafted throughput: %.2f tokens/s, "
             "Accepted: %d tokens, "
             "Drafted: %d tokens, "
+            "Real drafted (excl. padding): %d tokens, "
             "Per-position acceptance rate: %s, "
-            "Avg Draft acceptance rate: %.1f%%",
+            "Avg Draft acceptance rate: %.1f%%, "
+            "Real draft acceptance rate: %.1f%%",
             mean_acceptance_length,
             accepted_throughput,
             draft_throughput,
             num_accepted_tokens,
             num_draft_tokens,
+            num_real_draft_tokens,
             rates_str,
             draft_acceptance_rate,
+            real_draft_acceptance_rate,
         )
         self.reset()
 
@@ -229,6 +252,10 @@ class SpecDecodingProm:
                 ("vllm:spec_decode_num_drafts", "Number of spec decoding drafts."),
                 ("vllm:spec_decode_num_draft_tokens", "Number of draft tokens."),
                 ("vllm:spec_decode_num_accepted_tokens", "Number of accepted tokens."),
+                (
+                    "vllm:spec_decode_num_real_draft_tokens",
+                    "Number of draft tokens excluding padded placeholder slots.",
+                ),
             ]
 
         counters = [
@@ -243,6 +270,9 @@ class SpecDecodingProm:
         self.counter_spec_decode_num_drafts = counters[0]
         self.counter_spec_decode_num_draft_tokens = counters[1]
         self.counter_spec_decode_num_accepted_tokens = counters[2]
+        self.counter_spec_decode_num_real_draft_tokens = (
+            counters[3] if not is_diffusion else None
+        )
 
         self.counter_spec_decode_num_accepted_tokens_per_pos: dict[
             int, list[prometheus_client.Counter]
@@ -275,6 +305,10 @@ class SpecDecodingProm:
         self.counter_spec_decode_num_accepted_tokens[engine_idx].inc(
             spec_decoding_stats.num_accepted_tokens
         )
+        if self.counter_spec_decode_num_real_draft_tokens is not None:
+            self.counter_spec_decode_num_real_draft_tokens[engine_idx].inc(
+                spec_decoding_stats.num_real_draft_tokens
+            )
         for pos, counter in enumerate(
             self.counter_spec_decode_num_accepted_tokens_per_pos.get(engine_idx, [])
         ):

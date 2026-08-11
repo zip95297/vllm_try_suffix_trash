@@ -2494,15 +2494,17 @@ class Scheduler(SchedulerInterface):
     ) -> SpecDecodingStats | None:
         if not self.log_stats or not num_draft_tokens:
             return None
-        if num_invalid_spec_tokens:
-            num_draft_tokens -= num_invalid_spec_tokens.get(request_id, 0)
-            if num_draft_tokens <= 0:
-                # Every scheduled slot was padding: no real draft to record.
-                return spec_decoding_stats
         if spec_decoding_stats is None:
             spec_decoding_stats = SpecDecodingStats.new(self.num_spec_tokens)
+        num_invalid = (
+            num_invalid_spec_tokens.get(request_id, 0)
+            if num_invalid_spec_tokens
+            else 0
+        )
         spec_decoding_stats.observe_draft(
-            num_draft_tokens=num_draft_tokens, num_accepted_tokens=num_accepted_tokens
+            num_draft_tokens=num_draft_tokens,
+            num_accepted_tokens=num_accepted_tokens,
+            num_invalid_tokens=num_invalid,
         )
         return spec_decoding_stats
 
